@@ -43,7 +43,14 @@ def _replace_qmark_placeholders(sql: str) -> str:
         char = sql[index]
         nxt = sql[index + 1] if index + 1 < len(sql) else ""
         if state == "normal":
-            if char == "'":
+            if char == "%":
+                # Psycopg uses %-style placeholders.  Marketplace Hub SQL is
+                # written for SQLite and contains literal percent signs in
+                # LIKE patterns (e.g. '%cancel%') and occasionally formatting
+                # masks.  Escape every percent already present in the source
+                # SQL; qmark placeholders are converted to %s separately below.
+                out.append("%%")
+            elif char == "'":
                 state = "single"
                 out.append(char)
             elif char == '"':
@@ -62,7 +69,10 @@ def _replace_qmark_placeholders(sql: str) -> str:
             else:
                 out.append(char)
         elif state == "single":
-            out.append(char)
+            if char == "%":
+                out.append("%%")
+            else:
+                out.append(char)
             if char == "'":
                 if nxt == "'":
                     out.append(nxt)
@@ -70,7 +80,10 @@ def _replace_qmark_placeholders(sql: str) -> str:
                 else:
                     state = "normal"
         elif state == "double":
-            out.append(char)
+            if char == "%":
+                out.append("%%")
+            else:
+                out.append(char)
             if char == '"':
                 if nxt == '"':
                     out.append(nxt)
@@ -78,11 +91,11 @@ def _replace_qmark_placeholders(sql: str) -> str:
                 else:
                     state = "normal"
         elif state == "line_comment":
-            out.append(char)
+            out.append("%%" if char == "%" else char)
             if char == "\n":
                 state = "normal"
         elif state == "block_comment":
-            out.append(char)
+            out.append("%%" if char == "%" else char)
             if char == "*" and nxt == "/":
                 out.append(nxt)
                 index += 1
