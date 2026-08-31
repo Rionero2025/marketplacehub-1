@@ -683,7 +683,14 @@ if catalog_options:
         item = catalog_by_id[int(price_list_id)]
         supplier_name = clean_text(item.get("supplier_name")) or "Fornitore"
         list_name = clean_text(item.get("list_name")) or f"Listino {price_list_id}"
-        return f"{supplier_name} · {list_name}"
+        label = f"{supplier_name} · {list_name}"
+        if "innpro" in supplier_name.lower():
+            source_url = clean_text(item.get("source_url")).lower()
+            if "type=light" in source_url:
+                label += " · INGROSSO"
+            elif "type=full" in source_url:
+                label += " · FULL (non usato per Acquisto €)"
+        return label
 
     selected_catalog_ids = st.multiselect(
         "Seleziona i listini che possono determinare la colonna Acquisto €",
@@ -715,8 +722,9 @@ if catalog_options:
         st.caption(
             "Sono autorevoli solo i listini selezionati qui. Se per lo stesso EAN sono "
             "selezionati più listini compatibili, il motore usa la normale priorità del "
-            "fornitore e della versione più recente. Per Innpro puoi quindi lasciare "
-            "selezionato **Listino Light** e deselezionare **Listino Full**."
+            "fornitore e della versione più recente. Per Innpro il nome non deve contenere "
+            "la parola Light: il programma riconosce il feed ingrosso dal parametro "
+            "**type=light** dell'URL. I feed **type=full** restano esclusi dal costo automatico."
         )
 else:
     selected_catalog_ids = []
@@ -839,8 +847,10 @@ st.caption(
     "Il costo viene cercato tramite EAN/GTIN esatto esclusivamente nei listini che hai "
     "selezionato sopra. La selezione resta memorizzata per il Seller e vale anche per "
     "i successivi aggiornamenti API. Listini globali, condivisi e relative viste salvate "
-    "sono utilizzati solo se il loro listino padre è selezionato. Per Innpro resta la "
-    "protezione LIGHT: il prezzo FULL non viene usato come costo automatico. Sono "
+    "sono utilizzati solo se il loro listino padre è selezionato. Per Innpro il feed "
+    "ingrosso viene riconosciuto dall'URL (type=light), anche se il nome è per esempio "
+    "INNPRO 2408; in cloud viene riscaricato automaticamente se il vecchio file locale "
+    "non esiste più. I feed type=full non vengono usati come costo automatico. Sono "
     "riconosciuti anche i GTIN numerici presenti in code_producer o nella colonna SKU, "
     "senza usare SKU alfanumerici."
 )
