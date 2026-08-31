@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from services.accounting import ensure_schema
+from services.db import rows
 from services.dashboard import (
     DEFAULT_DASHBOARD_TIMEZONE,
     combined_dashboard_period,
@@ -21,6 +22,12 @@ from services.dashboard import (
 )
 from services.product_stats import aggregate_product_stats, filter_product_rows, sort_product_stats
 from services.session import bootstrap
+from services.security import (
+    clear_runtime_master_key,
+    runtime_master_key_active,
+    set_runtime_master_key,
+    validate_master_key,
+)
 
 
 bootstrap()
@@ -960,10 +967,77 @@ def render_dashboard() -> None:
     )
 
     if state.get("last_error"):
-        st.markdown(
-            f'<div class="dashboard-warning"><strong>Sincronizzazione parziale:</strong> {escape(str(state["last_error"]))}</div>',
-            unsafe_allow_html=True,
-        )
+        last_error = str(state["last_error"])
+        master_key_error = "Chiave master errata" in last_error
+        if master_key_error:
+            with st.expander(
+                "⚠️ Sincronizzazione parziale — clicca qui per inserire manualmente la chiave master",
+                expanded=False,
+            ):
+                st.warning(last_error)
+                st.caption(
+                    "La chiave inserita qui viene usata solo nella memoria del servizio e non viene "
+                    "salvata nel database né nei log. Rimane attiva fino al prossimo riavvio/deploy di Render."
+                )
+                if runtime_master_key_active():
+                    st.success("È già attiva una chiave master inserita manualmente in questo processo.")
+                with st.form("dashboard_manual_master_key_form", clear_on_submit=True):
+                    manual_master_key = st.text_input(
+                        "Chiave master",
+                        type="password",
+                        placeholder="Incolla qui la MARKETPLACE_HUB_MASTER_KEY",
+                    )
+                    apply_master_key = st.form_submit_button(
+                        "Verifica e usa chiave",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                if apply_master_key:
+                    encrypted_values = [
+                        item.get("credentials_encrypted")
+                        for item in rows(
+                            """SELECT credentials_encrypted FROM marketplace_accounts
+                            WHERE active=1 AND credentials_encrypted IS NOT NULL
+                            AND credentials_encrypted<>'' ORDER BY id"""
+                        )
+                    ]
+                    try:
+                        valid, checked = validate_master_key(
+                            manual_master_key, encrypted_values
+                        )
+                    except Exception as exc:
+                        st.error(f"Impossibile verificare la chiave: {exc}")
+                    else:
+                        if not valid:
+                            st.error(
+                                "La chiave non corrisponde alle credenziali cifrate presenti nel database. "
+                                "Controlla di averla copiata per intero."
+                            )
+                        else:
+                            set_runtime_master_key(manual_master_key)
+                            launch = start_dashboard_sync_background(force=True)
+                            st.success(
+                                f"Chiave verificata su {checked} account e applicata. "
+                                "La sincronizzazione è stata rilanciata automaticamente."
+                            )
+                            if launch.get("reason") == "running":
+                                st.info(
+                                    "Una sincronizzazione era già in corso: userà la nuova chiave "
+                                    "alla prossima esecuzione."
+                                )
+                if runtime_master_key_active():
+                    if st.button(
+                        "Rimuovi chiave manuale e torna alla configurazione Render",
+                        key="dashboard_clear_runtime_master_key",
+                        use_container_width=True,
+                    ):
+                        clear_runtime_master_key()
+                        st.success("Chiave manuale rimossa. Al prossimo accesso verrà usata quella configurata su Render.")
+        else:
+            st.markdown(
+                f'<div class="dashboard-warning"><strong>Sincronizzazione parziale:</strong> {escape(last_error)}</div>',
+                unsafe_allow_html=True,
+            )
 
     if not summaries:
         st.info("Apri **Gestione Seller** dal menu laterale per creare il primo Seller.")
