@@ -1050,6 +1050,7 @@ def resolve_purchase_cost(
     ean: Any,
     country_code: Any,
     quantity: int = 1,
+    composite_purchase_cost: Any = None,
 ) -> dict[str, Any]:
     """Resolve purchase cost by exact EAN, then by composite-SKU product code.
 
@@ -1057,19 +1058,36 @@ def resolve_purchase_cost(
     is the second component extracted by :func:`parse_composite_sku`.  Accounting
     first tries the order EAN/GTIN and, when that doesn't produce a positive cost,
     matches ``product_code`` exactly against the supplier catalogue ``sku``.
-    This is intentionally an exact identifier match: no fuzzy product-name match.
+    As a final safety fallback, when neither identifier can be resolved from an
+    accessible catalogue, the purchase cost already encoded in the composite
+    marketplace SKU is used. This preserves the original authoritative cost
+    captured at publication time even when a cloud catalogue is temporarily
+    unavailable. No fuzzy product-name match is performed.
     """
     supplier_key = normalize_supplier(supplier)
     ean_clean = _ean_from_values(ean, product_code)
     sku_clean = clean_identifier(product_code)
     sku_key = sku_clean.casefold()
     quantity = max(1, int(quantity or 1))
+    embedded_cost = _number(composite_purchase_cost)
+    if embedded_cost is not None and embedded_cost <= 0:
+        embedded_cost = None
 
     if not ean_clean and not sku_key:
+        if embedded_cost is not None:
+            return {
+                "unit_cost": round(float(embedded_cost), 4),
+                "total_cost": round(float(embedded_cost) * quantity, 2),
+                "source": "SKU composito · costo incorporato al momento della pubblicazione",
+                "matched_ean": "",
+                "matched_sku": "",
+                "matched_supplier": clean_text(supplier),
+                "matched_list": "SKU composito",
+            }
         return {
             "unit_cost": None,
             "total_cost": None,
-            "source": "Costo non calcolabile: EAN e codice SKU composito mancanti nell'ordine",
+            "source": "Costo non calcolabile: EAN, codice prodotto e costo SKU composito mancanti nell'ordine",
             "matched_ean": "",
             "matched_sku": "",
             "matched_supplier": "",
@@ -1078,6 +1096,16 @@ def resolve_purchase_cost(
 
     search_sources = _catalog_search_order(catalogs, supplier_key)
     if _is_innpro_supplier(supplier_key) and not search_sources:
+        if embedded_cost is not None:
+            return {
+                "unit_cost": round(float(embedded_cost), 4),
+                "total_cost": round(float(embedded_cost) * quantity, 2),
+                "source": "SKU composito · costo incorporato al momento della pubblicazione · feed Innpro non disponibile",
+                "matched_ean": ean_clean,
+                "matched_sku": sku_clean,
+                "matched_supplier": clean_text(supplier),
+                "matched_list": "SKU composito",
+            }
         return {
             "unit_cost": None,
             "total_cost": None,
@@ -1166,6 +1194,17 @@ def resolve_purchase_cost(
                 "matched_supplier": source.supplier_name,
                 "matched_list": source.list_name,
             }
+
+    if embedded_cost is not None:
+        return {
+            "unit_cost": round(float(embedded_cost), 4),
+            "total_cost": round(float(embedded_cost) * quantity, 2),
+            "source": "SKU composito · costo incorporato al momento della pubblicazione · fallback dopo match EAN/SKU",
+            "matched_ean": ean_clean,
+            "matched_sku": sku_clean,
+            "matched_supplier": clean_text(supplier),
+            "matched_list": "SKU composito",
+        }
 
     searched = []
     if ean_clean:
@@ -1329,6 +1368,9 @@ def _normalize_worten_line(
             "offer_sku", "seller_sku", "shop_sku", "offer_id", "sku", "product_sku",
         )
     )
+    composite_sku = _best_composite_sku(
+        composite_sku, {"order": dict(order), "line": dict(line)}
+    )
     parsed = parse_composite_sku(composite_sku)
     quantity = max(1, int(_number(_value(line, "quantity"), 1) or 1))
     customer = _customer_from_order(order)
@@ -1347,6 +1389,7 @@ def _normalize_worten_line(
         ean=ean,
         country_code=country_code,
         quantity=quantity,
+        composite_purchase_cost=parsed.purchase_cost,
     )
     currency = _currency_code(line, order)
     gross_local = _mirakl_sale_amount(line, quantity)
@@ -1686,6 +1729,7 @@ def fetch_kaufland_accounting_orders(
             ean=ean,
             country_code=country_code,
             quantity=1,
+            composite_purchase_cost=parsed.purchase_cost,
         )
         status_label = marketplace_status_label("kaufland", status)
         status_detail = clean_text(
@@ -2575,6 +2619,78 @@ def _ean_from_raw_json(value: Any) -> str:
     return visit(value)
 
 
+
+def _composite_sku_from_raw_json(value: Any) -> str:
+    """Recover the original marketplace offer SKU from cached raw API payloads.
+
+    Mirakl/Worten stores our composed SKU in ``offer_sku``. During migrations or
+    legacy synchronizations ``accounting_order_lines.composite_sku`` can contain
+    only the product code even though ``raw_json`` still contains the original
+    ``supplier_productcode_cost_minprice`` value. This helper recovers only a SKU
+    that is actually parseable by ``parse_composite_sku``; arbitrary API UUIDs or
+    offer IDs are ignored.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return ""
+
+    preferred_keys = (
+        "offer_sku", "seller_sku", "shop_sku", "marketplace_sku", "sku",
+    )
+
+    def valid(candidate: Any) -> str:
+        text = clean_text(candidate)
+        if not text:
+            return ""
+        parsed = parse_composite_sku(text)
+        return text if parsed.valid and parsed.supplier and parsed.product_code else ""
+
+    def visit(current: Any) -> str:
+        if isinstance(current, Mapping):
+            normalized = {
+                str(key).lower().replace("-", "_"): child
+                for key, child in current.items()
+            }
+            for key in preferred_keys:
+                if key in normalized:
+                    found = valid(normalized[key])
+                    if found:
+                        return found
+            for child in current.values():
+                if isinstance(child, (Mapping, list, tuple)):
+                    found = visit(child)
+                    if found:
+                        return found
+        elif isinstance(current, (list, tuple)):
+            for child in current:
+                found = visit(child)
+                if found:
+                    return found
+        return ""
+
+    return visit(value)
+
+
+def _best_composite_sku(stored_value: Any, raw_json: Any = None) -> str:
+    """Prefer a stored composed SKU, but recover the API original when needed."""
+    stored = clean_text(stored_value)
+    parsed = parse_composite_sku(stored)
+    recovered = _composite_sku_from_raw_json(raw_json) if raw_json is not None else ""
+    recovered_parsed = parse_composite_sku(recovered) if recovered else None
+
+    # A complete stored SKU (including purchase cost) is authoritative.
+    if parsed.valid and parsed.purchase_cost is not None:
+        return stored
+    # If the DB kept only supplier/product code or an old malformed value, the
+    # raw API offer_sku is the authoritative publication-time SKU.
+    if recovered_parsed and recovered_parsed.valid:
+        return recovered
+    if parsed.valid:
+        return stored
+    return recovered or stored
+
 def _without_cost_warning(note: Any) -> str:
     parts = [clean_text(part) for part in re.split(r"\s*;\s*", clean_text(note))]
     return "; ".join(
@@ -2632,7 +2748,17 @@ def refresh_accounting_costs(
             result["cancelled"] += 1
             continue
 
-        parsed = parse_composite_sku(item.get("composite_sku"))
+        recovered_composite_sku = _best_composite_sku(
+            item.get("composite_sku"), item.get("raw_json")
+        )
+        parsed = parse_composite_sku(recovered_composite_sku)
+        if recovered_composite_sku and recovered_composite_sku != clean_text(item.get("composite_sku")):
+            # Persist the recovered original offer SKU so future recalculations no
+            # longer depend on reparsing raw_json.
+            execute(
+                "UPDATE accounting_order_lines SET composite_sku=? WHERE id=?",
+                (recovered_composite_sku, int(item["id"])),
+            )
         ean = _ean_from_values(
             item.get("ean"), parsed.product_code, _ean_from_raw_json(item.get("raw_json"))
         )
@@ -2643,6 +2769,7 @@ def refresh_accounting_costs(
             ean=ean,
             country_code=item.get("country_code"),
             quantity=max(1, int(item.get("quantity") or 1)),
+            composite_purchase_cost=parsed.purchase_cost,
         )
         purchase = cost.get("total_cost")
         supplier = clean_text(item.get("supplier")) or clean_text(cost.get("matched_supplier"))
