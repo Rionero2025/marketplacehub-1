@@ -39,7 +39,7 @@ from services.kaufland_orders import (
     order_amounts_to_eur,
     response_item,
 )
-from services.lists import country_cost, normalize, read_list
+from services.lists import country_cost, download_url, normalize, read_list
 from services.profit_sharing import normalized_percentages, split_profit
 from services.worten import commission_rate_from_order_line
 
@@ -877,6 +877,23 @@ def load_supplier_catalogs(seller_id: int) -> list[CatalogSource]:
         if enabled_price_list_ids is not None and price_list_id not in enabled_price_list_ids:
             continue
         resolved = _resolve_catalog_path(item)
+        supplier_name = clean_text(item.get("supplier_name"))
+        source_url = clean_text(item.get("source_url"))
+        innpro_mode = _innpro_feed_mode_values(
+            list_name=item.get("list_name"), source_url=source_url, path=item.get("path")
+        )
+
+        # In cloud deployments the database can contain a perfectly valid price
+        # list while ``local_path`` still points to the old Windows PC. For Innpro
+        # wholesale feeds, rebuild the ephemeral local cache directly from the
+        # saved feed URL. This makes Accounting work after SQLite -> PostgreSQL
+        # migration even without a persistent disk. Explicit FULL feeds are never
+        # downloaded for automatic purchase-cost calculation.
+        if resolved is None and _is_innpro_supplier(supplier_name) and source_url and innpro_mode != "full":
+            try:
+                resolved = download_url(price_list_id, source_url)
+            except Exception:
+                resolved = None
         if resolved is None:
             continue
         path_key = str(resolved.resolve())
@@ -931,25 +948,67 @@ def _is_innpro_supplier(value: Any) -> bool:
     return "innpro" in normalize_supplier(value)
 
 
-def _is_innpro_light_source(source: CatalogSource) -> bool:
-    """Identify the Innpro LIGHT wholesale feed without relying on one URL shape."""
-    if not _is_innpro_supplier(source.supplier_key or source.supplier_name):
-        return False
-    descriptors = " ".join(
-        clean_text(value).lower()
-        for value in (source.list_name, source.source_url, source.path)
-        if clean_text(value)
-    )
-    if re.search(r"(?:^|[^a-z0-9])light(?:[^a-z0-9]|$)", descriptors):
-        return True
+def _innpro_feed_mode_values(*, list_name: Any = "", source_url: Any = "", path: Any = "") -> str:
+    """Return ``light``, ``full`` or ``unknown`` for an Innpro catalogue.
+
+    The accounting role must not depend on the human name of the price list. In
+    production many valid wholesale lists are named only ``INNPRO 2408`` or
+    ``feed INNPRO 0108``. The authoritative signal is the Innpro feed URL
+    (``type=light`` / ``type=full``); filenames are only a fallback.
+    """
+    url = clean_text(source_url)
     try:
-        query = parse_qs(urlparse(source.source_url).query)
+        query = parse_qs(urlparse(url).query)
     except Exception:
         query = {}
     for key in ("type", "feed", "mode", "variant", "catalog"):
-        if any(clean_text(value).lower() == "light" for value in query.get(key, [])):
-            return True
-    return False
+        values = [clean_text(value).lower() for value in query.get(key, [])]
+        if "light" in values:
+            return "light"
+        if "full" in values:
+            return "full"
+
+    descriptors = " ".join(
+        clean_text(value).lower()
+        for value in (list_name, path)
+        if clean_text(value)
+    )
+    if re.search(r"(?:^|[^a-z0-9])full(?:[^a-z0-9]|$)", descriptors):
+        return "full"
+    if re.search(r"(?:^|[^a-z0-9])light(?:[^a-z0-9]|$)", descriptors):
+        return "light"
+    return "unknown"
+
+
+def _is_innpro_full_source(source: CatalogSource) -> bool:
+    if not _is_innpro_supplier(source.supplier_key or source.supplier_name):
+        return False
+    return _innpro_feed_mode_values(
+        list_name=source.list_name, source_url=source.source_url, path=source.path
+    ) == "full"
+
+
+def _is_innpro_light_source(source: CatalogSource) -> bool:
+    """Identify a valid Innpro accounting/wholesale source.
+
+    ``type=light`` is preferred and explicit ``type=full`` is always rejected.
+    For legacy Innpro feeds without a mode marker, a selected source is accepted
+    when it contains normalized purchase costs. This removes the old requirement
+    that the word ``Light`` had to appear in the list name.
+    """
+    if not _is_innpro_supplier(source.supplier_key or source.supplier_name):
+        return False
+    mode = _innpro_feed_mode_values(
+        list_name=source.list_name, source_url=source.source_url, path=source.path
+    )
+    if mode == "full":
+        return False
+    if mode == "light":
+        return True
+    if "cost" not in source.frame.columns:
+        return False
+    costs = pd.to_numeric(source.frame.get("cost"), errors="coerce").fillna(0)
+    return bool(costs.gt(0).any())
 
 
 def _catalog_search_order(
@@ -1011,8 +1070,9 @@ def resolve_purchase_cost(
             "total_cost": None,
             "source": (
                 "Costo non calcolabile: per Innpro la Contabilità usa esclusivamente "
-                "il prezzo all'ingrosso del listino LIGHT; nessun listino LIGHT Innpro "
-                "accessibile è stato trovato"
+                "un feed ingrosso utilizzabile. Il nome del listino non deve contenere 'Light': "
+                "il programma riconosce automaticamente i feed Innpro LIGHT (type=light) e li "
+                "riscarica in cloud quando il vecchio file locale non è più presente"
             ),
             "matched_ean": "",
             "matched_sku": "",
@@ -1071,8 +1131,8 @@ def resolve_purchase_cost(
     )
     if _is_innpro_supplier(supplier_key):
         missing_source = (
-            f"Costo non calcolabile: EAN {ean_clean} non trovato nei listini "
-            "LIGHT Innpro accessibili; il prezzo del FULL non viene usato in Contabilità"
+            f"Costo non calcolabile: EAN {ean_clean} non trovato nei feed Innpro "
+            "ingrosso selezionati; i feed esplicitamente FULL non vengono usati come costo"
         )
     return {
         "unit_cost": None,
