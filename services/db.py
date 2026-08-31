@@ -1128,9 +1128,55 @@ def json_text(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _authenticated_seller_scope() -> set[int] | None:
+    """Return seller IDs allowed for the current Streamlit user.
+
+    ``None`` means unrestricted (administrator, legacy session, or non-UI context).
+    The helper intentionally reads only session_state to avoid an import cycle
+    db -> auth -> user_access -> db.
+    """
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            return None
+        import streamlit as st
+        session = st.session_state.get("_marketplace_hub_user_session")
+    except Exception:
+        return None
+    if not isinstance(session, dict):
+        return None
+    if bool(session.get("is_admin")):
+        return None
+    values = session.get("seller_ids")
+    # v291 legacy users have seller_ids=None and keep all sellers until the admin
+    # saves an explicit multiple selection in Gestione Utenti.
+    if values is None:
+        return None
+    result: set[int] = set()
+    for value in values or []:
+        try:
+            seller_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if seller_id > 0:
+            result.add(seller_id)
+    return result
+
+
 def sellers(active_only=True) -> list[dict]:
-    where = "WHERE active=1" if active_only else ""
-    return rows(f"SELECT * FROM sellers {where} ORDER BY name")
+    scope = _authenticated_seller_scope()
+    clauses: list[str] = []
+    params: list[int] = []
+    if active_only:
+        clauses.append("active=1")
+    if scope is not None:
+        if not scope:
+            return []
+        ordered = sorted(scope)
+        clauses.append(f"id IN ({','.join('?' for _ in ordered)})")
+        params.extend(ordered)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return rows(f"SELECT * FROM sellers {where} ORDER BY name", tuple(params))
 
 
 def accessible_lists(seller_id: int) -> list[dict]:
