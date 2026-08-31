@@ -377,7 +377,7 @@ def test_connection(config: dict[str, Any] | None = None) -> dict[str, Any]:
     with psycopg.connect(**settings, row_factory=dict_row) as connection:
         row = connection.execute(
             "SELECT current_database() AS database, current_user AS username, "
-            "server_version AS version"
+            "current_setting('server_version') AS version"
         ).fetchone()
         return dict(row or {})
 
