@@ -3,12 +3,8 @@ services:
     name: marketplace-hub
     runtime: docker
     region: frankfurt
-    plan: 1c-2g
+    plan: free
     healthCheckPath: /_stcore/health
-    disk:
-      name: marketplace-hub-data
-      mountPath: /app/data
-      sizeGB: 20
     envVars:
       - key: DATABASE_URL
         fromDatabase:
@@ -25,20 +21,18 @@ services:
       - key: MARKETPLACE_HUB_ADMIN_PASSWORD
         sync: false
       - key: MARKETPLACE_HUB_PG_POOL_MIN
-        value: "2"
+        value: "1"
       - key: MARKETPLACE_HUB_PG_POOL_MAX
-        value: "12"
+        value: "4"
       - key: TZ
         value: Europe/Rome
-
 
 databases:
   - name: marketplace-hub-db
     region: frankfurt
-    plan: 0.5c-1g
+    plan: free
     databaseName: marketplace_hub
     user: marketplace_hub
     postgresMajorVersion: "17"
-    diskSizeGB: 15
-    storageAutoscalingEnabled: true
     ipAllowList: []
+
