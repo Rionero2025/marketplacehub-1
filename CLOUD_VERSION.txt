@@ -1,0 +1,3 @@
+Marketplace Hub Public Cloud v273
+Base applicativa: v271
+Cloud packaging: v273
