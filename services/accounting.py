@@ -916,7 +916,16 @@ def load_supplier_catalogs(seller_id: int) -> list[CatalogSource]:
         frame["_ean_key"] = frame["_ean_keys"].map(
             lambda values: values[0] if values else "",
         )
-        frame = frame[frame["_ean_keys"].map(bool)].copy()
+        # Accounting can identify a product in two authoritative ways:
+        # 1) exact EAN/GTIN; 2) exact supplier SKU extracted from our composite
+        #    marketplace SKU (supplier_productcode_cost_minprice).
+        # Do not discard catalogue rows that have a supplier SKU but no EAN.
+        frame["_sku_key"] = frame["sku"].map(
+            lambda value: clean_identifier(value).casefold(),
+        )
+        frame = frame[
+            frame["_ean_keys"].map(bool) | frame["_sku_key"].astype(bool)
+        ].copy()
         if frame.empty:
             continue
         sources.append(
@@ -1042,21 +1051,25 @@ def resolve_purchase_cost(
     country_code: Any,
     quantity: int = 1,
 ) -> dict[str, Any]:
-    """Resolve purchase cost by exact EAN across every loaded catalogue.
+    """Resolve purchase cost by exact EAN, then by composite-SKU product code.
 
-    ``product_code`` is used only when it itself contains a valid EAN (as in the
-    second component of the composite SKU). No SKU-only match is performed in
-    accounting, preventing a supplier article code from being mistaken for an
-    EAN.
+    Marketplace SKUs use ``supplier_productcode_cost_minprice``.  ``product_code``
+    is the second component extracted by :func:`parse_composite_sku`.  Accounting
+    first tries the order EAN/GTIN and, when that doesn't produce a positive cost,
+    matches ``product_code`` exactly against the supplier catalogue ``sku``.
+    This is intentionally an exact identifier match: no fuzzy product-name match.
     """
     supplier_key = normalize_supplier(supplier)
     ean_clean = _ean_from_values(ean, product_code)
+    sku_clean = clean_identifier(product_code)
+    sku_key = sku_clean.casefold()
     quantity = max(1, int(quantity or 1))
-    if not ean_clean:
+
+    if not ean_clean and not sku_key:
         return {
             "unit_cost": None,
             "total_cost": None,
-            "source": "Costo non calcolabile: EAN mancante nell'ordine",
+            "source": "Costo non calcolabile: EAN e codice SKU composito mancanti nell'ordine",
             "matched_ean": "",
             "matched_sku": "",
             "matched_supplier": "",
@@ -1069,10 +1082,9 @@ def resolve_purchase_cost(
             "unit_cost": None,
             "total_cost": None,
             "source": (
-                "Costo non calcolabile: per Innpro la Contabilità usa esclusivamente "
-                "un feed ingrosso utilizzabile. Il nome del listino non deve contenere 'Light': "
-                "il programma riconosce automaticamente i feed Innpro LIGHT (type=light) e li "
-                "riscarica in cloud quando il vecchio file locale non è più presente"
+                "Costo non calcolabile: per Innpro non è disponibile alcun feed ingrosso "
+                "selezionato/utilizzabile. Il nome del listino non deve contenere 'Light': "
+                "il programma riconosce i feed type=light e può riscaricarli in cloud"
             ),
             "matched_ean": "",
             "matched_sku": "",
@@ -1082,56 +1094,92 @@ def resolve_purchase_cost(
 
     for source in search_sources:
         frame = source.frame
-        if "_ean_keys" in frame:
-            match = frame["_ean_keys"].map(
-                lambda values: ean_clean in tuple(values or ()),
+        strategies: list[tuple[str, str, pd.Series]] = []
+
+        if ean_clean:
+            if "_ean_keys" in frame:
+                ean_match = frame["_ean_keys"].map(
+                    lambda values: ean_clean in tuple(values or ()),
+                )
+            else:
+                barcode_columns = _catalog_barcode_columns(frame)
+                ean_match = frame.apply(
+                    lambda row: ean_clean in _row_ean_keys(row, barcode_columns), axis=1,
+                )
+            strategies.append(("EAN", ean_clean, ean_match))
+
+        if sku_key:
+            if "_sku_key" in frame:
+                sku_match = frame["_sku_key"].astype(str).eq(sku_key)
+            else:
+                sku_match = frame.get("sku", pd.Series("", index=frame.index)).map(
+                    lambda value: clean_identifier(value).casefold() == sku_key
+                )
+            strategies.append(("SKU composito", sku_clean, sku_match))
+
+        for match_kind, match_value, match in strategies:
+            if not bool(match.any()):
+                continue
+            selected = frame.loc[match].copy()
+            if "cecotec" in source.supplier_key:
+                costs = country_cost(
+                    selected, normalize_country_code(country_code).lower()
+                )
+            else:
+                costs = pd.to_numeric(
+                    selected.get("cost", 0), errors="coerce"
+                ).fillna(0)
+            positive = costs[costs.gt(0)]
+            if positive.empty:
+                # The identifier exists in this source but has no usable cost.
+                # Continue with the second identifier and then newer/other sources.
+                continue
+
+            unit_cost = float(positive.iloc[0])
+            matched_index = positive.index[0]
+            row_ean = clean_identifier(
+                selected.loc[matched_index, "ean"]
+                if "ean" in selected.columns else ""
             )
-        else:
-            barcode_columns = _catalog_barcode_columns(frame)
-            match = frame.apply(
-                lambda row: ean_clean in _row_ean_keys(row, barcode_columns), axis=1,
+            matched_ean = row_ean or (ean_clean if match_kind == "EAN" else "")
+            matched_sku = clean_identifier(
+                selected.loc[matched_index, "sku"]
+                if "sku" in selected.columns else ""
             )
-        if not match.any():
-            continue
-        selected = frame.loc[match].copy()
-        if "cecotec" in source.supplier_key:
-            costs = country_cost(selected, normalize_country_code(country_code).lower())
-        else:
-            costs = pd.to_numeric(selected.get("cost", 0), errors="coerce").fillna(0)
-        positive = costs[costs.gt(0)]
-        if positive.empty:
-            continue
-        unit_cost = float(positive.iloc[0])
-        matched_index = positive.index[0]
-        matched_ean = ean_clean
-        matched_sku = clean_identifier(selected.loc[matched_index, "sku"])
-        global_fallback = bool(
-            supplier_key and not _supplier_compatible(source.supplier_key, supplier_key)
-        )
-        source_text = (
-            f"{source.supplier_name} · {source.list_name} · "
-            f"{source.source_kind} · match EAN esatto {ean_clean}"
-        )
-        if _is_innpro_light_source(source):
-            source_text += " · prezzo all'ingrosso LIGHT Innpro"
-        if global_fallback:
-            source_text += " · trovato cercando in tutti i listini"
-        return {
-            "unit_cost": round(unit_cost, 4),
-            "total_cost": round(unit_cost * quantity, 2),
-            "source": source_text,
-            "matched_ean": matched_ean,
-            "matched_sku": matched_sku,
-            "matched_supplier": source.supplier_name,
-            "matched_list": source.list_name,
-        }
+            global_fallback = bool(
+                supplier_key and not _supplier_compatible(source.supplier_key, supplier_key)
+            )
+            source_text = (
+                f"{source.supplier_name} · {source.list_name} · "
+                f"{source.source_kind} · match {match_kind} esatto {match_value}"
+            )
+            if _is_innpro_light_source(source):
+                source_text += " · prezzo all'ingrosso Innpro"
+            if global_fallback:
+                source_text += " · trovato cercando in tutti i listini"
+            return {
+                "unit_cost": round(unit_cost, 4),
+                "total_cost": round(unit_cost * quantity, 2),
+                "source": source_text,
+                "matched_ean": matched_ean,
+                "matched_sku": matched_sku,
+                "matched_supplier": source.supplier_name,
+                "matched_list": source.list_name,
+            }
+
+    searched = []
+    if ean_clean:
+        searched.append(f"EAN {ean_clean}")
+    if sku_clean:
+        searched.append(f"SKU {sku_clean}")
+    identifiers = " e ".join(searched) or "identificativi ordine"
     missing_source = (
-        f"Costo non calcolabile: EAN {ean_clean} non trovato "
+        f"Costo non calcolabile: {identifiers} non trovati con costo valido "
         f"nei {len(catalogs)} listini caricati"
     )
     if _is_innpro_supplier(supplier_key):
         missing_source = (
-            f"Costo non calcolabile: EAN {ean_clean} non trovato nei feed Innpro "
+            f"Costo non calcolabile: {identifiers} non trovati nei feed Innpro "
             "ingrosso selezionati; i feed esplicitamente FULL non vengono usati come costo"
         )
     return {
